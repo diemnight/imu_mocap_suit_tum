@@ -1,4 +1,3 @@
-import socket
 import struct
 import math
 import threading
@@ -14,9 +13,12 @@ import matplotlib.animation as animation
 import matplotlib.gridspec as gridspec
 from collections import deque
 import numpy as np
+import serial
 
 
 PACKET_SIZE = 35
+PORT = '/dev/ttyACM0'
+BAUD = 921600
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 latest_q = [1.0, 0.0, 0.0, 0.0]
@@ -71,28 +73,34 @@ def quat_inverse(q):
 def apply_calibration(q, ref):
     return quat_multiply(quat_inverse(ref), q)
 
-# ── UDP receiver (background thread) ─────────────────────────────────────────
-def udp_receiver():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(('', 5005))
-    sock.settimeout(1.0)
-    print(f"Listening for UDP on port 5005")
+def serial_receiver():
+    ser = serial.Serial(PORT, BAUD, timeout=1)
 
+    def find_header():
+        while True:
+            try:
+                b1 = ser.read(1)
+                if b1 and b1[0] == 0xAA:
+                    b2 = ser.read(1)
+                    if b2 and b2[0] == 0xFF:
+                        return True
+            except Exception:
+                pass
+
+    find_header()
     while True:
         try:
-            data, addr = sock.recvfrom(1024)
-
-            if len(data) < 35:
-                continue
-            if data[0] != 0xAA or data[1] != 0xFF:
+            raw = ser.read(33)  # 35 - 2 header bytes
+            if len(raw) < 33:
+                find_header()
                 continue
 
-            board_id = data[2]
-            ts, qw, qi, qj, qk, ax, ay, az = struct.unpack_from('<Ifffffff', data, 3)
+            board_id = raw[0]
+            ts, qw, qi, qj, qk, ax, ay, az = struct.unpack_from('<Ifffffff', raw, 1)
 
             mag = math.sqrt(qw**2 + qi**2 + qj**2 + qk**2)
             if not (0.9 < mag < 1.1):
+                find_header()
                 continue
 
             with q_lock:
@@ -119,10 +127,11 @@ def udp_receiver():
                     csv_writer.writerow([board_id, ts, qw, qi, qj, qk, ax, ay, az])
                     csv_file.flush()
 
-        except socket.timeout:
-            continue
+            find_header()
+
         except Exception as e:
-            print(f"UDP error: {e}")
+            print(f"Serial error: {e}")
+            find_header()
             
                         
 # ── Session graph ─────────────────────────────────────────────────────────────
@@ -291,7 +300,7 @@ def draw_axes():
 def main():
     global q_ref, calibrated, recording, csv_file, csv_writer
 
-    threading.Thread(target=udp_receiver, daemon=True).start()
+    threading.Thread(target=serial_receiver, daemon=True).start()
     threading.Thread(target=run_live_graph, daemon=True).start()
 
     pygame.init()
