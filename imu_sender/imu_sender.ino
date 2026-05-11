@@ -1,118 +1,155 @@
-#include <SPI.h>
+#include <Wire.h>
 #include <Adafruit_BNO08x.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
 
-// ── WiFi credentials ──────────────────────────────────────────────────────────
-const char* SSID     = "IMU_network";
-const char* PASSWORD = "imu12345";
+// ── Pins ───────────────────────────────────────────────────────────────────────
+#define SDA_PIN       8
+#define SCL_PIN       9
+#define MUX_RESET_PIN 4
 
-// ── PC IP and port — change this to your PC's local IP ───────────────────────
-const char* PC_IP   = "10.42.0.1";
-const uint16_t PORT = 5005;     // destination port (PC receives on this)
-const uint16_t SRC_PORT = 5006;   // source port (ESP32 sends from this)
+// ── TCA9548A ───────────────────────────────────────────────────────────────────
+#define MUX_ADDR 0x70
+#define NUM_IMUS  6
 
-// ── SPI + IMU pins ────────────────────────────────────────────────────────────
-#define SPI_SCK      12
-#define SPI_MISO     13
-#define SPI_MOSI     11
-#define BNO08X_CS    10
-#define BNO08X_INT   9
-#define BNO08X_RESET 5
-
-Adafruit_BNO08x bno08x(BNO08X_RESET);
+// ── Single reusable IMU instance ──────────────────────────────────────────────
+Adafruit_BNO08x imu(-1);
 sh2_SensorValue_t sensorValue;
-WiFiUDP udp;
 
-float qw = 1, qi = 0, qj = 0, qk = 0;
-float ax = 0, ay = 0, az = 0;
+bool imu_ok[NUM_IMUS] = { false };
 
-void connectWiFi() {
-  Serial.print("Connecting to WiFi");
-  WiFi.begin(SSID, PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("Connected — IP: ");
-  Serial.println(WiFi.localIP());
+// ── Per-IMU state ──────────────────────────────────────────────────────────────
+float qw[NUM_IMUS], qi[NUM_IMUS], qj[NUM_IMUS], qk[NUM_IMUS];
+float ax[NUM_IMUS], ay[NUM_IMUS], az[NUM_IMUS];
+
+// ── Select a TCA9548A channel (0-7) ───────────────────────────────────────────
+void muxSelect(uint8_t channel) {
+  Wire.beginTransmission(MUX_ADDR);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+  delayMicroseconds(200);
 }
 
-void setup() {
-  Serial.begin(115200);
-  while (!Serial) delay(10);
-
-  connectWiFi();
-
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, BNO08X_CS);
-  if (!bno08x.begin_SPI(BNO08X_CS, BNO08X_INT, &SPI)) {
-    Serial.println("Failed to find BNO08x chip");
-    while (1) delay(10);
-  }
-  Serial.println("BNO08x found!");
-
-  bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, 5000);
-  bno08x.enableReport(SH2_LINEAR_ACCELERATION, 5000);
-
-  udp.begin(SRC_PORT);
+// ── Reset the TCA9548A ────────────────────────────────────────────────────────
+void muxReset() {
+  digitalWrite(MUX_RESET_PIN, LOW);
+  delay(10);
+  digitalWrite(MUX_RESET_PIN, HIGH);
+  delay(10);
 }
 
-void sendPacket() {
-  // packet: [0xAA][0xFF][board_id 1][ts 4][qw 4][qi 4][qj 4][qk 4][ax 4][ay 4][az 4]
-  // total: 2 + 1 + 4 + 28 = 35 bytes
+// ── Enable rotation vector + linear accel ─────────────────────────────────────
+void enableReports() {
+  imu.enableReport(SH2_GAME_ROTATION_VECTOR, 5000);
+  imu.enableReport(SH2_LINEAR_ACCELERATION,  5000);
+}
+
+// ── Send 35-byte binary packet over Serial ────────────────────────────────────
+void sendPacket(uint8_t id,
+                float qw_, float qi_, float qj_, float qk_,
+                float ax_, float ay_, float az_) {
   uint8_t buf[35];
   uint32_t ts = micros();
-
   buf[0] = 0xAA;
   buf[1] = 0xFF;
-  buf[2] = 0x01;  // board ID — change this per ESP32 (1-6)
-  memcpy(buf + 3,  &ts, 4);
-  memcpy(buf + 7,  &qw, 4);
-  memcpy(buf + 11, &qi, 4);
-  memcpy(buf + 15, &qj, 4);
-  memcpy(buf + 19, &qk, 4);
-  memcpy(buf + 23, &ax, 4);
-  memcpy(buf + 27, &ay, 4);
-  memcpy(buf + 31, &az, 4);
-
-  udp.beginPacket(PC_IP, PORT);
-  udp.write(buf, 35);
-  int result = udp.endPacket();
-  Serial.print("Sending to: ");
-  Serial.print(PC_IP);
-  Serial.print(":");
-  Serial.println(PORT);
-  Serial.print("endPacket: ");
-  Serial.println(result);
+  buf[2] = id;
+  memcpy(buf + 3,  &ts,  4);
+  memcpy(buf + 7,  &qw_, 4);
+  memcpy(buf + 11, &qi_, 4);
+  memcpy(buf + 15, &qj_, 4);
+  memcpy(buf + 19, &qk_, 4);
+  memcpy(buf + 23, &ax_, 4);
+  memcpy(buf + 27, &ay_, 4);
+  memcpy(buf + 31, &az_, 4);
+  Serial.write(buf, 35);
 }
 
+// ── Setup ─────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(921600);
+  delay(1000);
+
+  pinMode(MUX_RESET_PIN, OUTPUT);
+  digitalWrite(MUX_RESET_PIN, HIGH);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  muxReset();
+  delay(100);
+
+  // Init using ONLY the first available IMU found
+  bool driver_initialized = false;
+
+  for (uint8_t ch = 0; ch < NUM_IMUS; ch++) {
+    muxSelect(ch);
+    delay(200);
+
+    Wire.beginTransmission(0x4B);
+    if (Wire.endTransmission() != 0) {
+      Serial.print("IMU "); Serial.print(ch);
+      Serial.println(" not visible, skipping");
+      imu_ok[ch] = false;
+      continue;
+    }
+
+    imu_ok[ch] = true;
+    Serial.print("IMU "); Serial.print(ch); Serial.println(" visible");
+
+    if (!driver_initialized) {
+      // Only call begin_I2C once ever
+      if (imu.begin_I2C(0x4B, &Wire)) {
+        driver_initialized = true;
+        enableReports();
+        Serial.print("IMU "); Serial.print(ch); Serial.println(" driver initialized OK");
+      } else {
+        Serial.println("Driver init FAILED");
+        imu_ok[ch] = false;
+      }
+    } else {
+      // For subsequent IMUs, just enable reports — the chip is fresh
+      enableReports();
+      Serial.print("IMU "); Serial.print(ch); Serial.println(" reports enabled");
+    }
+    delay(100);
+  }
+
+  for (uint8_t ch = 0; ch < NUM_IMUS; ch++) {
+    if (!imu_ok[ch]) continue;
+    muxSelect(ch);
+    delay(50);
+    enableReports();
+    delay(50);
+  }
+  Wire.setClock(400000);
+  Serial.println("SETUP DONE --- streaming ---");
+}
+
+// ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
-  // Reconnect if WiFi drops
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi lost — reconnecting...");
-    connectWiFi();
-  }
+  for (uint8_t ch = 0; ch < NUM_IMUS; ch++) {
+    if (!imu_ok[ch]) continue;
 
-  if (bno08x.wasReset()) {
-    bno08x.enableReport(SH2_GAME_ROTATION_VECTOR, 5000);
-    bno08x.enableReport(SH2_LINEAR_ACCELERATION, 5000);
-  }
+    muxSelect(ch);
 
-  if (bno08x.getSensorEvent(&sensorValue)) {
-    switch (sensorValue.sensorId) {
-      case SH2_GAME_ROTATION_VECTOR:
-        qw = sensorValue.un.gameRotationVector.real;
-        qi = sensorValue.un.gameRotationVector.i;
-        qj = sensorValue.un.gameRotationVector.j;
-        qk = sensorValue.un.gameRotationVector.k;
-        sendPacket();
-        break;
-      case SH2_LINEAR_ACCELERATION:
-        ax = sensorValue.un.linearAcceleration.x;
-        ay = sensorValue.un.linearAcceleration.y;
-        az = sensorValue.un.linearAcceleration.z;
-        break;
+    if (imu.wasReset()) enableReports();
+
+    if (imu.getSensorEvent(&sensorValue)) {
+      switch (sensorValue.sensorId) {
+
+        case SH2_GAME_ROTATION_VECTOR:
+          qw[ch] = sensorValue.un.gameRotationVector.real;
+          qi[ch] = sensorValue.un.gameRotationVector.i;
+          qj[ch] = sensorValue.un.gameRotationVector.j;
+          qk[ch] = sensorValue.un.gameRotationVector.k;
+          sendPacket(ch + 1,
+                     qw[ch], qi[ch], qj[ch], qk[ch],
+                     ax[ch], ay[ch], az[ch]);
+          break;
+
+        case SH2_LINEAR_ACCELERATION:
+          ax[ch] = sensorValue.un.linearAcceleration.x;
+          ay[ch] = sensorValue.un.linearAcceleration.y;
+          az[ch] = sensorValue.un.linearAcceleration.z;
+          break;
+      }
     }
   }
 }
